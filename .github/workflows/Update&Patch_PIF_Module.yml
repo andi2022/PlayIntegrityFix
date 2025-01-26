@@ -1,0 +1,101 @@
+name: Update&Patch_PIF_Module
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - 'update.json'  # Ignore changes to update.json
+  schedule: 
+   - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: self-hosted
+    permissions:
+      contents: write  # Ensure the workflow has write permissions for contents
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.WORKER_TOKEN}}
+
+      - name: Install dependencies
+        run: sudo apt install -y curl jq unzip zip
+
+      - name: Install GitHub CLI if not installed
+        run: |
+          if ! command -v gh &> /dev/null; then
+            echo "GitHub CLI not found. Installing..."
+            type -p curl >/dev/null || (sudo apt update && sudo apt install curl -y)
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+          else
+            echo "GitHub CLI is already installed."
+          fi
+      - name: Grant execute permission for script
+        run: chmod +x pif.sh
+
+      - name: Run pif.sh
+        id: run_pif
+        run: ./pif.sh
+        continue-on-error: true
+
+      - name: Check pif.sh result
+        id: check_pif
+        run: |
+          if [ "${{ steps.run_pif.outcome }}" == "failure" ]; then
+            echo "pif_failed=true" >> $GITHUB_ENV
+          else
+            echo "pif_failed=false" >> $GITHUB_ENV
+          fi
+ 
+      - name: Read version from update.json
+        if: env.pif_failed == 'false'
+        id: read_version
+        run: |
+          version=$(jq -r '.version' update.json)
+          echo "VERSION=$version" >> $GITHUB_ENV
+          echo "ASSET_NAME=PlayIntegrityFix_${version}.zip" >> $GITHUB_ENV
+    
+      - name: Delete existing tag and release
+        if: env.pif_failed == 'false'
+        run: |
+          gh release delete ${{ env.VERSION }} -y || true
+          git tag -d ${{ env.VERSION }} || true
+          git push origin :refs/tags/${{ env.VERSION }} || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.WORKER_TOKEN }}
+    
+      - name: Create & Upload GitHub Release
+        if: env.pif_failed == 'false' && success()
+        id: create_release
+        run: |
+          gh release create ${{ env.VERSION }} ./PlayIntegrityFix_${{ env.VERSION }}.zip --title "${{ env.VERSION }}" --notes $'Read changelog here:\nhttps://raw.githubusercontent.com/chiteroman/PlayIntegrityFix/refs/heads/main/changelog.md\n\nPatched: ro.adb.secure 0'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construct release URL
+        if: env.pif_failed == 'false' && success()
+        id: construct_url
+        run: |
+          release_url="https://github.com/andi2022/PlayIntegrityFix/releases/download/${{ env.VERSION }}/PlayIntegrityFix_${{ env.VERSION }}.zip"
+          echo "RELEASE_URL=$release_url" >> $GITHUB_ENV
+
+      - name: Update zipUrl in update.json
+        if: env.pif_failed == 'false' && success()
+        run: |
+          jq --arg new_url "${{ env.RELEASE_URL }}" '.zipUrl = $new_url' update.json > tmp.json && mv tmp.json update.json
+
+      - name: commit changes
+        if: env.pif_failed == 'false' && success()
+        run: |
+          git config --global user.name "andi2022"
+          git config --global user.email "username@users.noreply.github.com"
+          git add update.json
+          git commit -m "Update update.json"
+          git push
